@@ -88,4 +88,22 @@ workspace_lvgl/
         └── van_ui_anim_init.cpp Enregistrement animations
 ```
 
-> Code BLE et meteo partage avec les autres workspaces dans `../shared/`
+> Code BLE et meteo partage avec les autres workspaces dans `
+../shared/`
+│   ├── ble/ 
+		├── ble_scanner.cpp
+        ├── ble_scanner.h   
+        ├── heating_ble.cpp
+		├── heating_ble.h
+		├── jkbms_ble.cpp
+		├── jkbms_ble.h
+		├── victron_ble.cpp
+		├── victron_ble.h
+│   ├── water/   
+		├── water_level.cpp
+        ├── water_level.h   
+│   ├── weather/
+		├── weather.cpp
+        ├── weather.h   
+bluetooth_config.h
+config_base.h
