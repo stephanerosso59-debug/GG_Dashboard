@@ -1,170 +1,251 @@
 /*
- * ble_scanner.cpp - Outil de capture BLE pour ESP32
- * Flash sur ESP32, ouvrir le moniteur serie (115200 baud)
- * Affiche TOUS les appareils BLE avec :
- *   - Adresse MAC
- *   - Nom
- *   - RSSI (puissance signal)
- *   - Services UUID
- *   - Manufacturer Data (hex brut)
- *   - Detection automatique JKBMS et Victron
+ * ble_scanner.cpp — Scanner BLE unifié GG VAN Dashboard
+ * =====================================================
+ * Dépendances : NimBLE-Arduino, mbedtls (AES)
+ *
+ * Principe de fonctionnement :
+ *   1. Scan passif BLE toutes les VICTRON_SCAN_INTERVAL_MS ms
+ *      → Filtre sur manufacturer_id Victron (0x02E1)
+ *      → Dispatch vers VictronBle::onAdvertisement()
+ *   2. Détection JKBMS par MAC → connexion GATT active
+ *      → Poll toutes les JKBMS_POLL_INTERVAL_MS ms
+ *   3. Connexion GATT chauffage → commandes ON/OFF/setpoint
  */
-#include <Arduino.h>
-#include <NimBLEDevice.h>
 
-// ─── Configuration ───────────────────────────────────────────────────────────
-#define SCAN_DURATION_SEC  10    // Duree scan (secondes)
-#define SCAN_INTERVAL_SEC  5     // Pause entre scans
-#define FILTER_RSSI       -90    // Ignorer si signal trop faible (dBm)
+#include "ble_scanner.h"
 
-// UUIDs connus
-#define JKBMS_SERVICE     "0000ffe0-0000-1000-8000-00805f9b34fb"
-#define VICTRON_MANUF_ID  0x02E1
+// ── Instance globale ─────────────────────────────────────────
+BleScanner* BleScanner::instance = nullptr;
+BleScanner  bleScanner;
 
-static NimBLEScan* pScan = nullptr;
-static int scanCount = 0;
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-static void printHex(const uint8_t* data, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        if (data[i] < 0x10) Serial.print("0");
-        Serial.print(data[i], HEX);
-        if (i < len - 1) Serial.print(" ");
-    }
-}
-
-static const char* identifyDevice(NimBLEAdvertisedDevice* dev) {
-    // Detecter JKBMS par UUID service
-    if (dev->haveServiceUUID()) {
-        if (dev->isAdvertisingService(NimBLEUUID(JKBMS_SERVICE)))
-            return "[JKBMS]";
-    }
-    // Detecter Victron par Manufacturer ID
-    if (dev->haveManufacturerData()) {
-        std::string md = dev->getManufacturerData();
-        if (md.size() >= 2) {
-            uint16_t mid = (uint8_t)md[0] | ((uint8_t)md[1] << 8);
-            if (mid == VICTRON_MANUF_ID) return "[VICTRON]";
-        }
-    }
-    // Detecter par nom
-    if (dev->haveName()) {
-        std::string name = dev->getName();
-        if (name.find("JK") != std::string::npos) return "[JKBMS?]";
-        if (name.find("Victron") != std::string::npos || 
-            name.find("SmartSolar") != std::string::npos ||
-            name.find("SmartShunt") != std::string::npos ||
-            name.find("BMV") != std::string::npos) return "[VICTRON?]";
-    }
-    return "";
-}
-
-// ─── Callback scan ───────────────────────────────────────────────────────────
-class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
-    void onResult(NimBLEAdvertisedDevice* dev) override {
-        if (dev->getRSSI() < FILTER_RSSI) return;
-
-        const char* tag = identifyDevice(dev);
-
-        Serial.println("────────────────────────────────────────");
-        Serial.printf("  MAC      : %s %s\n", dev->getAddress().toString().c_str(), tag);
-        Serial.printf("  RSSI     : %d dBm\n", dev->getRSSI());
-
-        if (dev->haveName())
-            Serial.printf("  Nom      : %s\n", dev->getName().c_str());
-
-        if (dev->haveServiceUUID()) {
-            Serial.printf("  Services : ");
-            for (int i = 0; i < dev->getServiceUUIDCount(); i++) {
-                Serial.printf("%s ", dev->getServiceUUID(i).toString().c_str());
-            }
-            Serial.println();
-        }
-
-        if (dev->haveManufacturerData()) {
-            std::string md = dev->getManufacturerData();
-            uint16_t mid = 0;
-            if (md.size() >= 2) mid = (uint8_t)md[0] | ((uint8_t)md[1] << 8);
-            Serial.printf("  Manuf ID : 0x%04X (%d bytes)\n", mid, md.size());
-            Serial.printf("  Data hex : ");
-            printHex((const uint8_t*)md.c_str(), md.size());
-            Serial.println();
-
-            // Si Victron, decoder le type d'appareil
-            if (mid == VICTRON_MANUF_ID && md.size() >= 6) {
-                uint8_t recType = (uint8_t)md[2];
-                uint16_t modelId = (uint8_t)md[4] | ((uint8_t)md[5] << 8);
-                static const char* recTypes[] = {
-                    "Solar Charger", "Battery Monitor", "Inverter",
-                    "DC/DC", "SmartLithium", "Inverter RS",
-                    "GX Device", "AC Charger", "Smart Battery Protect",
-                    "Lynx Smart BMS", "Multi RS", "VE.Bus", "DC Energy Meter"
-                };
-                Serial.printf("  Victron  : Record=%s(0x%02X) Model=0x%04X\n",
-                    recType < 13 ? recTypes[recType] : "Unknown", recType, modelId);
-
-                // Afficher les 16 octets de donnees chiffrees
-                if (md.size() >= 22) {
-                    Serial.printf("  Encrypted: ");
-                    printHex((const uint8_t*)md.c_str() + 6, md.size() - 6);
-                    Serial.println();
-                }
-            }
-        }
-
-        // Service Data
-        if (dev->haveServiceData()) {
-            Serial.printf("  SvcData  : ");
-            std::string sd = dev->getServiceData();
-            printHex((const uint8_t*)sd.c_str(), sd.size());
-            Serial.println();
-        }
-
-        // TX Power
-        if (dev->haveTXPower())
-            Serial.printf("  TX Power : %d dBm\n", dev->getTXPower());
-
-        Serial.printf("  Type     : %s\n",
-            dev->isConnectable() ? "Connectable" : "Non-connectable (advert only)");
-    }
+// ── Liste des MAC connues (minuscules, séparées par ':') ─────
+const char* BleScanner::_KNOWN_MACS[] = {
+    JKBMS_MAC_ADDRESS,
+    VICTRON_MPPT_MAC,
+    VICTRON_BMV_MAC,
+    VICTRON_BP_MAC,
+    VICTRON_ORION_MAC,      // = VICTRON_SMARTSHUNT_MAC
+    HEATING_BLE_MAC
 };
+const size_t BleScanner::_KNOWN_MAC_COUNT =
+    sizeof(_KNOWN_MACS) / sizeof(_KNOWN_MACS[0]);
 
-// ─── Setup ───────────────────────────────────────────────────────────────────
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-
-    Serial.println();
-    Serial.println("╔══════════════════════════════════════════════╗");
-    Serial.println("║   ESP32 BLE Scanner / Capture Tool          ║");
-    Serial.println("║   Detecte : JKBMS, Victron (MPPT, Shunt)   ║");
-    Serial.println("╚══════════════════════════════════════════════╝");
-    Serial.println();
-
-    NimBLEDevice::init("ESP32-BLE-Scanner");
-    pScan = NimBLEDevice::getScan();
-    pScan->setAdvertisedDeviceCallbacks(new ScanCallbacks(), false);
-    pScan->setActiveScan(true);   // Demande scan response pour plus d'infos
-    pScan->setInterval(100);
-    pScan->setWindow(99);
-
-    Serial.printf("Config : scan=%ds, pause=%ds, RSSI min=%ddBm\n\n",
-                  SCAN_DURATION_SEC, SCAN_INTERVAL_SEC, FILTER_RSSI);
+// ============================================================
+//  BleScannerCallbacks::onResult
+//  Appelé par NimBLE pour chaque advertisement reçu
+// ============================================================
+void BleScannerCallbacks::onResult(NimBLEAdvertisedDevice* dev) {
+    if (BleScanner::instance)
+        BleScanner::instance->onAdvertisement(dev);
 }
 
-// ─── Loop ────────────────────────────────────────────────────────────────────
-void loop() {
-    scanCount++;
-    Serial.println("════════════════════════════════════════════════");
-    Serial.printf("  SCAN #%d - %ds ...\n", scanCount, SCAN_DURATION_SEC);
-    Serial.println("════════════════════════════════════════════════");
+// ============================================================
+//  Constructeur
+// ============================================================
+BleScanner::BleScanner() {
+    instance = this;
+    memset(&_status, 0, sizeof(_status));
+    _lastScanStartMs = 0;
+}
 
-    pScan->start(SCAN_DURATION_SEC, false);
+// ============================================================
+//  begin() — Initialisation NimBLE + modules
+// ============================================================
+void BleScanner::begin() {
+    Serial.println("[BLE] Initialisation scanner...");
 
-    int found = pScan->getResults().getCount();
-    Serial.println();
-    Serial.printf(">>> %d appareils trouves (scan #%d)\n\n", found, scanCount);
+    NimBLEDevice::init("GG_VAN_DASHBOARD");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // Puissance max
 
-    pScan->clearResults();
-    delay(SCAN_INTERVAL_SEC * 1000);
+    // Initialise les modules
+    victron.begin();   // enregistre ses propres callbacks via victronBle
+    jkbms.begin();
+    heating.begin();
+
+    // Lance le premier scan
+    _startScan();
+
+    Serial.println("[BLE] Scanner démarré");
+    Serial.printf("[BLE] %zu appareils connus :\n", _KNOWN_MAC_COUNT);
+    for (size_t i = 0; i < _KNOWN_MAC_COUNT; i++)
+        Serial.printf("      [%zu] %s\n", i, _KNOWN_MACS[i]);
+}
+
+// ============================================================
+//  update() — À appeler dans loop()
+// ============================================================
+void BleScanner::update() {
+    uint32_t now = millis();
+
+    // ── Relance scan périodique ──────────────────────────────
+    if (!_status.scanning &&
+        (now - _lastScanStartMs) >= VICTRON_SCAN_INTERVAL_MS) {
+        _startScan();
+    }
+
+    // ── Mise à jour JKBMS (poll GATT) ───────────────────────
+    jkbms.update();
+
+    // ── Mise à jour chauffage BLE ────────────────────────────
+    heating.update();
+
+    // ── Mise à jour statuts connexion ───────────────────────
+    _status.jkbms_connected   = jkbms.isConnected();
+    _status.heating_connected = heating.isConnected();
+
+    // ── Détection timeouts (appareil disparu > 30 s) ────────
+    const uint32_t TIMEOUT_MS = 30000;
+    if (_status.mppt_seen && (now - _status.mppt_last_ms) > TIMEOUT_MS)
+        _status.mppt_seen = false;
+    if (_status.bmv_seen  && (now - _status.bmv_last_ms)  > TIMEOUT_MS)
+        _status.bmv_seen  = false;
+    if (_status.bp_seen   && (now - _status.bp_last_ms)   > TIMEOUT_MS)
+        _status.bp_seen   = false;
+    if (_status.orion_seen && (now - _status.orion_last_ms) > TIMEOUT_MS)
+        _status.orion_seen = false;
+}
+
+// ============================================================
+//  onAdvertisement() — Dispatch par MAC
+// ============================================================
+void BleScanner::onAdvertisement(NimBLEAdvertisedDevice* dev) {
+    std::string mac = dev->getAddress().toString();
+    uint32_t    now = millis();
+
+    // ── JKBMS ────────────────────────────────────────────────
+    if (_macEquals(mac, JKBMS_MAC_ADDRESS)) {
+        _status.jkbms_seen    = true;
+        _status.jkbms_last_ms = now;
+        // La connexion GATT est gérée par jkbms.update()
+        return;
+    }
+
+    // ── Appareils Victron (advertisement passif + AES decrypt) ─
+    // Vérification manufacturer ID Victron (0x02E1)
+    if (dev->haveManufacturerData()) {
+        std::string mfr = dev->getManufacturerData();
+        if (mfr.size() >= 2) {
+            uint16_t mfr_id = (uint8_t)mfr[0] | ((uint8_t)mfr[1] << 8);
+            if (mfr_id == VICTRON_MANUFACTURER_ID) {
+
+                if (_macEquals(mac, VICTRON_MPPT_MAC)) {
+                    _status.mppt_seen    = true;
+                    _status.mppt_last_ms = now;
+                    _status.mppt_updates++;
+                }
+                else if (_macEquals(mac, VICTRON_BMV_MAC)) {
+                    _status.bmv_seen    = true;
+                    _status.bmv_last_ms = now;
+                    _status.bmv_updates++;
+                }
+                else if (_macEquals(mac, VICTRON_BP_MAC)) {
+                    _status.bp_seen    = true;
+                    _status.bp_last_ms = now;
+                    _status.bp_updates++;
+                }
+                else if (_macEquals(mac, VICTRON_ORION_MAC)) {
+                    // OrionSmart ET SmartShunt partagent la même MAC
+                    // Le dispatch par record_type est géré dans victron_ble.cpp
+                    _status.orion_seen    = true;
+                    _status.orion_last_ms = now;
+                    _status.orion_updates++;
+                }
+
+                // Délégation au parser Victron (AES decrypt + struct fill)
+                victron.onAdvertisement(dev);
+            }
+        }
+    }
+
+    // ── Chauffage (filtrage MAC seulement — connexion GATT async) ─
+    if (_macEquals(mac, HEATING_BLE_MAC)) {
+        // heating.update() gère la reconnexion si nécessaire
+        return;
+    }
+}
+
+// ============================================================
+//  _startScan()
+// ============================================================
+void BleScanner::_startScan() {
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    scan->setAdvertisedDeviceCallbacks(&_callbacks, true);
+    scan->setActiveScan(false);   // Passif = économie énergie pour Victron
+    scan->setInterval(160);       // 100 ms
+    scan->setWindow(80);          //  50 ms
+
+    // Durée du scan : 5 s non-bloquant
+    scan->start(5, false);
+
+    _status.scanning     = true;
+    _status.scan_count++;
+    _lastScanStartMs     = millis();
+
+    // Arrêt automatique après 5 s (NimBLE callback interne)
+    // On considère le scan terminé après VICTRON_SCAN_INTERVAL_MS
+}
+
+// ============================================================
+//  _stopScan()
+// ============================================================
+void BleScanner::_stopScan() {
+    NimBLEDevice::getScan()->stop();
+    _status.scanning = false;
+}
+
+// ============================================================
+//  isMacKnown()
+// ============================================================
+bool BleScanner::isMacKnown(const std::string& mac) const {
+    for (size_t i = 0; i < _KNOWN_MAC_COUNT; i++)
+        if (_macEquals(mac, _KNOWN_MACS[i])) return true;
+    return false;
+}
+
+// ============================================================
+//  _macEquals() — Comparaison insensible à la casse
+// ============================================================
+bool BleScanner::_macEquals(const std::string& a, const char* b) const {
+    std::string sb(b);
+    if (a.size() != sb.size()) return false;
+    for (size_t i = 0; i < a.size(); i++)
+        if (toupper(a[i]) != toupper(sb[i])) return false;
+    return true;
+}
+
+// ============================================================
+//  printStatus() — Debug Serial
+// ============================================================
+void BleScanner::printStatus() const {
+    Serial.println("===== BLE Scanner Status =====");
+    Serial.printf("Scans: %lu  |  Scanning: %s\n",
+        _status.scan_count, _status.scanning ? "OUI" : "NON");
+    Serial.println("--- Victron ---");
+    Serial.printf("  SmartSolar MPPT  %s  (%s)  mises à jour: %lu\n",
+        VICTRON_MPPT_MAC,
+        _status.mppt_seen ? "VU " : "---",
+        _status.mppt_updates);
+    Serial.printf("  SmartBMV 712     %s  (%s)  mises à jour: %lu\n",
+        VICTRON_BMV_MAC,
+        _status.bmv_seen ? "VU " : "---",
+        _status.bmv_updates);
+    Serial.printf("  BatteryProtect   %s  (%s)  mises à jour: %lu\n",
+        VICTRON_BP_MAC,
+        _status.bp_seen ? "VU " : "---",
+        _status.bp_updates);
+    Serial.printf("  OrionSmart/Shunt %s  (%s)  mises à jour: %lu\n",
+        VICTRON_ORION_MAC,
+        _status.orion_seen ? "VU " : "---",
+        _status.orion_updates);
+    Serial.println("--- JK-BMS ---");
+    Serial.printf("  %s  Vu:%s  Connecté:%s  màj:%lu\n",
+        JKBMS_MAC_ADDRESS,
+        _status.jkbms_seen      ? "OUI" : "NON",
+        _status.jkbms_connected ? "OUI" : "NON",
+        _status.jkbms_updates);
+    Serial.println("--- Chauffage ---");
+    Serial.printf("  %s  Connecté:%s\n",
+        HEATING_BLE_MAC,
+        _status.heating_connected ? "OUI" : "NON");
+    Serial.println("==============================");
 }
