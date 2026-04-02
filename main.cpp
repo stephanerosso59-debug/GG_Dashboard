@@ -2,15 +2,14 @@
 // ESP32 + TFT ILI9341 + LVGL
 // BLE : JKBMS (NimBLE actif) + Victron (publicites passives)
 // WiFi : NTP + OpenWeatherMap
+// WATCHDOG : TWDT 30 secondes
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <NTPClient.h>
-#include <WiFiUDP.h>
+#include <WiFiUdp.h>
+#include <esp_task_wdt.h>
 
 #include "config.h"
-
-// Modules partages depuis shared/ (via -I ../shared dans platformio.ini)
 #include "ble/jkbms_ble.h"
 #include "ble/victron_ble.h"
 #include "ble/heating_ble.h"
@@ -23,43 +22,83 @@
 #include "ui/lvgl_anim_icons.h"
 #include "gps/gps.h"
 
-// Forward declaration (defini dans ui/van_ui_anim_init.cpp)
+// Forward declaration
 void van_anims_init(void);
 
-// ─── Timers ──────────────────────────────────────────────────────────────────
-static uint32_t t_weather_update = 0;
-static uint32_t t_ntp_update     = 0;
-static uint32_t t_clock_update   = 0;
-static uint32_t t_ble_update     = 0;
+// ─── Constants ──────────────────────────────────────────
+#define WDT_TIMEOUT_SEC      30
+#define WIFI_MAX_RETRIES     3
 
-WiFiUDP   ntp_udp;
+// ─── Timers ──────────────────────────────────────────────
+static uint32_t t_weather_update = 0;
+static uint32_t t_ntp_update = 0;
+static uint32_t t_clock_update = 0;
+static uint32_t t_ble_update = 0;
+static uint8_t wifi_retry_count = 0;
+
+WiFiUDP ntp_udp;
 NTPClient ntp_client(ntp_udp, NTP_SERVER, NTP_GMT_OFFSET + NTP_DST_OFFSET);
 
-// ─── WiFi ────────────────────────────────────────────────────────────────────
+// ─── WiFi (Amélioré avec retry) ─────────────────────────
 static void wifi_connect() {
-    Serial.printf("[WiFi] Connexion a %s ", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    for (uint8_t i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-        delay(500); Serial.print(".");
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("[WiFi] Deja connecte");
+        van_anim_set_wifi(true);
+        return;
     }
+
+    Serial.printf("[WiFi] Connexion a %s (tentative %d/%d)...\n", 
+                  WIFI_SSID, wifi_retry_count + 1, WIFI_MAX_RETRIES);
+    
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    for (uint8_t i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+        delay(500);
+        esp_task_wdt_reset();
+        Serial.print(".");
+    }
+
     bool ok = (WiFi.status() == WL_CONNECTED);
-    Serial.printf("\n[WiFi] %s\n", ok ? WiFi.localIP().toString().c_str() : "Echec");
+
+    if (ok) {
+        wifi_retry_count = 0;
+        Serial.printf("[WiFi] OK - IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        wifi_retry_count++;
+        if (wifi_retry_count >= WIFI_MAX_RETRIES) {
+            Serial.printf("[WiFi] ECHEF apres %d tentatives - Mode offline\n", wifi_retry_count);
+        }
+    }
+
     van_anim_set_wifi(ok);
 }
 
-// ─── Setup ───────────────────────────────────────────────────────────────────
+// ─── Setup ────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    Serial.println("[LVGL] Van Dashboard demarrage...");
+    delay(500);
+    
+    Serial.println("[GG_Dashboard] Demarrage...");
+
+    // ✅ Watchdog
+    Serial.println("[WDT] Initialisation Watchdog (30s)...");
+    esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
+    esp_task_wdt_add(NULL);
+    Serial.println("[WDT] OK");
 
     // Relais OFF par defaut
     const uint8_t relay_pins[] = {
         RELAY_LIGHT1, RELAY_LIGHT2, RELAY_LIGHT3,
-        RELAY_LIGHT4, RELAY_LIGHT5,
+        RELAY_LIGHT4, RELAY_LIGHT5, RELAY_LIGHT6,
         RELAY_TV,
-        RELAY_WATER_PUMP, RELAY_WATER_HEATER
+        RELAY_WATER_PUMP,
+        RELAY_WATER_HEATER
     };
-    for (auto p : relay_pins) { pinMode(p, OUTPUT); digitalWrite(p, RELAY_OFF); }
+
+    for (auto p : relay_pins) {
+        pinMode(p, OUTPUT);
+        digitalWrite(p, RELAY_OFF);
+    }
 
     // LVGL + TFT
     ui.begin();
@@ -87,28 +126,25 @@ void setup() {
     // GPS NEO-6M (UART2)
     gps_init();
 
-    // Niveau eau (CBE MT214/M)
+    // Niveau eau
     water_level_init();
 
-    // Animations (a appeler apres ui.begin() qui cree les widgets)
+    // Animations
     van_anims_init();
 
-    Serial.println("[LVGL] Initialisation terminee");
+    Serial.println("[GG_Dashboard] PRET - Watchdog ACTIF");
 }
 
-// ─── Loop ────────────────────────────────────────────────────────────────────
+// ─── Loop ────────────────────────────────────────────────
 void loop() {
     uint32_t now = millis();
 
-    // LVGL handler (LV_TICK_CUSTOM=1 : millis() utilise automatiquement)
     lv_timer_handler();
 
-    // BLE update
     jkBms.update();
     victronBle.update();
     heatingBle.update();
 
-    // Niveau eau
     water_level_update();
 
     // Etat BLE -> animations
@@ -116,23 +152,25 @@ void loop() {
         t_ble_update = now;
         bool ble_ok = jkBms.isConnected();
         van_anim_set_ble(ble_ok);
+
         if (ble_ok) {
             const JkBmsData& d = jkBms.getData();
             van_anim_set_battery_charging(d.battery_current > 0.0f);
         }
-        // Mise a jour pages si visibles
+
         if (ui.currentPage() == PAGE_BATTERY) page_battery_update();
-        if (ui.currentPage() == PAGE_HOME)    page_home_update();
+        if (ui.currentPage() == PAGE_HOME) page_home_update();
     }
 
     // Horloge
     if (now - t_clock_update >= UI_CLOCK_UPDATE_MS) {
         t_clock_update = now;
         ntp_client.update();
-        if (ui.currentPage() == PAGE_HOME)    page_home_update();
-        if (ui.currentPage() == PAGE_SYSTEM)  page_system_update();
-        page_heating_update();  // timer auto-extinction chauffe-eau (toutes les secondes)
-        gps_update();           // parsing GPS NEO-6M (toutes les secondes)
+        
+        if (ui.currentPage() == PAGE_HOME) page_home_update();
+        if (ui.currentPage() == PAGE_SYSTEM) page_system_update();
+        page_heating_update();
+        gps_update();
     }
 
     // Meteo (toutes les 10 min)
@@ -151,9 +189,14 @@ void loop() {
     // Reconnexion WiFi + NTP
     if (now - t_ntp_update >= UPDATE_PERIOD_NTP_MS) {
         t_ntp_update = now;
-        if (WiFi.status() != WL_CONNECTED) wifi_connect();
+        if (WiFi.status() != WL_CONNECTED) {
+            wifi_connect();
+        }
         van_anim_set_wifi(WiFi.status() == WL_CONNECTED);
     }
+
+    // ✅ Reset Watchdog
+    esp_task_wdt_reset();
 
     delay(5);
 }

@@ -1,24 +1,35 @@
 /*
- * page_lights.cpp - Page controle eclairages (5 lumieres + TV)
+ * page_lights.cpp - Page controle eclairages (6 lumieres + TV)
+ * v1.1 - Correction: Ajout RELAY_LIGHT6 manquant
  */
+
 #include "ui.h"
 #include "ui_helpers.h"
 #include "../config.h"
 
-// GPIO pour chaque relais (definis dans config.h)
+// ✅ Tableau complet: 6 lumieres + 1 TV = 7 relais
 static const int RELAY_PINS[] = {
-    RELAY_LIGHT1, RELAY_LIGHT2, RELAY_LIGHT3,
-    RELAY_LIGHT4, RELAY_LIGHT5,
-    RELAY_TV
+    RELAY_LIGHT1,   // Salon
+    RELAY_LIGHT2,   // Cuisine
+    RELAY_LIGHT3,   // Chambre
+    RELAY_LIGHT4,   // WC
+    RELAY_LIGHT5,   // Ext. Avant
+    RELAY_LIGHT6,   // Ext. Arriere ✨ NOUVEAU
+    RELAY_TV         // Television
 };
 
 static const char* RELAY_NAMES[] = {
-    "Salon", "Cuisine", "Chambre",
-    "WC", "Ext. Avant",
+    "Salon",
+    "Cuisine",
+    "Chambre",
+    "WC",
+    "Ext. Avant",
+    "Ext. Arriere",  // ✨ NOUVEAU
     "Television"
 };
 
-#define NUM_RELAYS 6
+// ✅ CORRIGE: 7 relais (etait 6 avant)
+#define NUM_RELAYS 7
 
 static bool relay_state[NUM_RELAYS] = {false};
 
@@ -30,6 +41,7 @@ static lv_obj_t* lbl_relay[NUM_RELAYS] = {};
 static void cb_switch(lv_event_t* e) {
     uint8_t idx = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
     lv_obj_t* sw = lv_event_get_target(e);
+    
     relay_state[idx] = lv_obj_has_state(sw, LV_STATE_CHECKED);
     digitalWrite(RELAY_PINS[idx], relay_state[idx] ? RELAY_ON : RELAY_OFF);
 
@@ -53,8 +65,6 @@ static void cb_all_off(lv_event_t* e) {
     }
 }
 
-// ---- Callback retour home — supprimé, remplacé par nav bar ----
-
 // ============================================================
 //  page_lights_build()
 // ============================================================
@@ -63,8 +73,6 @@ void page_lights_build(lv_obj_t* parent) {
 
     ui_create_title_bar(parent, LV_SYMBOL_SETTINGS, "Eclairage & TV", COLOR_YELLOW);
 
-    // Grille 3x2 pour les 6 lumieres + 1 TV
-    // Disposition : 2 colonnes, 4 lignes (3 paires + TV)
     int col_w = (SCREEN_WIDTH - 40) / 2;
     int row_h = 54;
     int x_start = 12;
@@ -76,7 +84,7 @@ void page_lights_build(lv_obj_t* parent) {
         int px = x_start + col * (col_w + 8);
         int py = y_start + row * (row_h + 6);
 
-        // Si TV (dernier relay) on la centre sur toute la largeur
+        // TV centrée sur toute la largeur
         if (i == NUM_RELAYS - 1) {
             px = x_start + col_w / 2 - 10;
         }
@@ -85,7 +93,7 @@ void page_lights_build(lv_obj_t* parent) {
         lv_obj_set_size(card, (i == NUM_RELAYS - 1) ? col_w + 8 : col_w, row_h);
         lv_obj_set_pos(card, (i == NUM_RELAYS - 1) ? (SCREEN_WIDTH - col_w - 8) / 2 : px, py);
         lv_obj_add_style(card, &ui.style_card, 0);
-        lv_obj_set_style_pad_all(card, 6, 0);
+        lv_obj_set_pad_all(card, 6, 0);
 
         // LED indicateur
         led_relay[i] = lv_led_create(card);
@@ -117,7 +125,8 @@ void page_lights_build(lv_obj_t* parent) {
     lv_obj_set_style_bg_opa(btn_off, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(btn_off, 10, 0);
     lv_obj_set_style_border_width(btn_off, 0, 0);
-    lv_obj_add_event_cb(btn_off, cb_all_off, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_off, cb_all_off, LV_EVENT_CLICKED, NULL);
+    
     lv_obj_t* lbl_off = lv_label_create(btn_off);
     lv_label_set_text(lbl_off, LV_SYMBOL_POWER "  Tout eteindre");
     lv_obj_set_style_text_font(lbl_off, &lv_font_montserrat_14, 0);
@@ -130,6 +139,5 @@ void page_lights_build(lv_obj_t* parent) {
         digitalWrite(RELAY_PINS[i], RELAY_OFF);
     }
 
-    // Barre de navigation inférieure
     ui_create_nav_bar(parent, PAGE_LIGHTS);
 }
