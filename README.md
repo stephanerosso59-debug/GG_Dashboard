@@ -86,9 +86,9 @@ workspace_lvgl/
         ├── lvgl_anim_icons.h  Moteur animation lv_timer
         ├── lvgl_icons_data.h  Frames RGB565 (genere)
         └── van_ui_anim_init.cpp Enregistrement animations
-```
 
-> Code BLE et meteo partage avec les autres workspaces dans `
+
+Code BLE et meteo partage avec les autres workspaces dans `
 ../shared/`
 │   ├── ble/ 
 		├── ble_scanner.cpp
@@ -107,3 +107,4 @@ workspace_lvgl/
         ├── weather.h   
 bluetooth_config.h
 config_base.h
+```
