@@ -1,387 +1,419 @@
+/*
+ * page_weather.cpp - Page Météo BME280 (Version corrigée)
+ * 
+ * Pattern : Fonctions globales (cohérent avec page_home, page_lights, etc.)
+ * Remplace l'ancienne classe PageWeather qui n'était pas intégrée à UiManager
+ * 
+ * Dépendances :
+ *   - weather.h / weather.cpp (API OpenWeatherMap + BME280)
+ *   - bme280_alerts.h (Alertes : gel, condensation, humidité, pression)
+ *   - bme280_history.h (Historique 24h pour graphique)
+ *   - ui_helpers.h (ui_create_title_bar, ui_create_nav_bar)
+ */
 
 #include "page_weather.h"
-#include <math.h>
+#include "ui.h"
+#include "ui_helpers.h"
+#include "../config.h"
+#include "../../shared/weather/weather.h"
+#include "../../shared/weather/bme280_sensor.h"
+#include "bme280_alerts.h"
+#include "bme280_history.h"
 
-PageWeather::PageWeather() 
-    : page(nullptr), alertContainer(nullptr), tempArc(nullptr),
-      tempLabel(nullptr), comfortLabel(nullptr), tempMinLabel(nullptr),
-      tempMaxLabel(nullptr), humidityLabel(nullptr), humidityTrend(nullptr),
-      pressureLabel(nullptr), pressureTrend(nullptr), dewPointBar(nullptr),
-      dewPointLabel(nullptr), altitudeLabel(nullptr), chart(nullptr),
-      tempSeries(nullptr), humSeries(nullptr) {
+#include <cstring>
+
+// ═══════════════════════════════════════════════════════════════════════
+//  VARIABLES STATIQUES (Widgets LVGL)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Zone alertes (dynamique)
+lv_obj_t* weather_alert_container = nullptr;
+
+// Carte température intérieure
+lv_obj_t* weather_temp_arc = nullptr;
+lv_obj_t* weather_temp_label = nullptr;
+lv_obj_t* weather_comfort_label = nullptr;
+
+// Min/Max 24h
+lv_obj_t* weather_temp_min_label = nullptr;
+lv_obj_t* weather_temp_max_label = nullptr;
+
+// Environnement
+lv_obj_t* weather_humidity_label = nullptr;
+lv_obj_t* weather_humidity_trend = nullptr;
+lv_obj_t* weather_pressure_label = nullptr;
+lv_obj_t* weather_pressure_trend = nullptr;
+lv_obj_t* weather_dew_point_bar = nullptr;
+lv_obj_t* weather_dew_point_label = nullptr;
+
+// Extérieur
+lv_obj_t* weather_outdoor_icon = nullptr;
+lv_obj_t* weather_outdoor_temp = nullptr;
+lv_obj_t* weather_wind_label = nullptr;
+
+// Graphique historique
+lv_obj_t* weather_chart = nullptr;
+lv_chart_series_t* weather_temp_series = nullptr;
+lv_chart_series_t* weather_hum_series = nullptr;
+
+// Instance alertes
+BME280Alerts bmeAlerts;
+
+// Instance historique
+BME280History bmeHistory;
+
+// ═══════════════════════════════════════════════════════════════════════
+//  HELPERS INTERNES
+// ═══════════════════════════════════════════════════════════════════════
+
+// Couleur selon température
+static lv_color_t getTempColor(float temp) {
+    if (temp <= 2.0f)  return lv_color_hex(0x3498DB);  // Bleu - froid/gel
+    if (temp <= 15.0f) return lv_color_hex(0x74B9FF;  // Bleu clair
+    if (temp <= 25.0f) return lv_color_hex(0x2ECC71);  // Vert - confortable
+    if (temp <= 35.0f) return lv_color_hex(0xF39C12);  // Orange - chaud
+    return lv_color_hex(0xE74C3C);              // Rouge - très chaud
 }
 
-void PageWeather::create() {
-    page = lv_obj_create(NULL);
-    lv_obj_set_size(page, 480, 320);
-    lv_obj_set_style_bg_color(page, lv_color_hex(0x1a1a2e), 0);
-    
-    // Dégradé background
-    lv_obj_set_style_bg_grad_color(page, lv_color_hex(0x16213e), 0);
-    lv_obj_set_style_bg_grad_dir(page, LV_GRAD_DIR_VER, 0);
-    
-    // Header
-    lv_obj_t* header = lv_label_create(page);
-    lv_label_set_text(header, "METEO");
-    lv_obj_set_style_text_font(header, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(header, lv_color_hex(0xffffff), 0);
-    lv_obj_set_pos(header, 20, 10);
-    
-    // Zone alertes (haut)
-    createAlertsArea(page);
-    
-    // Grille 3 cartes
-    createTempCard(page);
-    createEnvCard(page);
-    createOutdoorCard(page);
-    
-    // Graphique historique (bas)
-    createHistoryChart(page);
+// Texte confort
+static const char* getComfortText(float temp) {
+    if (temp < 16.0f) return "Froid ❄️";
+    if (temp < 20.0f) return "Frais ✅";
+    if (temp < 26.0f) return "Confortable ✅";
+    if (temp < 32.0f) return "Chaud ⚠️";
+    return "Très chaud 🔥";
 }
 
-void PageWeather::createAlertsArea(lv_obj_t* parent) {
-    alertContainer = lv_obj_create(parent);
-    lv_obj_set_size(alertContainer, 440, 0); // Hauteur dynamique
-    lv_obj_set_pos(alertContainer, 20, 40);
-    lv_obj_set_style_bg_opa(alertContainer, LV_OPA_0, 0);
-    lv_obj_set_style_border_width(alertContainer, 0, 0);
-    lv_obj_set_style_pad_all(alertContainer, 0, 0);
-    lv_obj_set_flex_flow(alertContainer, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(alertContainer, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+// Icône tendance
+static const char* getTrendIcon(float trend) {
+    if (trend > 0.5f)  return "↑";
+    if (trend < -0.5f) return "↓";
+    return "→";
 }
 
-void PageWeather::createTempCard(lv_obj_t* parent) {
-    lv_obj_t* card = createCard(parent, "INTERIEUR", 20, 90);
+// Créer un badge d'alerte
+static lv_obj_t* createAlertBadge(lv_obj_t* parent, Alert& alert) {
+    lv_obj_t* badge = lv_label_create(parent);
     
-    // Arc température
-    tempArc = lv_arc_create(card);
-    lv_obj_set_size(tempArc, 100, 100);
-    lv_obj_set_pos(tempArc, 10, 25);
-    lv_arc_set_range(tempArc, -10, 50);
-    lv_arc_set_value(tempArc, 20);
-    lv_arc_set_bg_angles(tempArc, 120, 60); // 270° arc
-    lv_obj_set_style_arc_width(tempArc, 10, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(tempArc, 10, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(tempArc, lv_color_hex(0x333333), LV_PART_MAIN);
+    // Format : "⚠ Message"
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s %s",
+             alert.type == ALERT_FREEZE ? "❄️" :
+             alert.type == ALERT_CONDENSATION ? "💧" :
+             alert.type == ALERT_HIGH_HUMIDITY ? "💨" :
+             alert.type == ALERT_LOW_PRESSURE ? "🌪️" : "🔥",
+             alert.message);
     
-    // Label température centre
-    tempLabel = lv_label_create(card);
-    lv_label_set_text(tempLabel, "--.-°");
-    lv_obj_set_style_text_font(tempLabel, &lv_font_montserrat_24, 0);
-    lv_obj_center(tempLabel);
-    lv_obj_set_align(tempLabel, LV_ALIGN_CENTER);
-    lv_obj_set_pos(tempLabel, 10, 25);
+    lv_label_set_text(badge, buf);
+    lv_obj_set_style_text_font(badge, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(badge, alert.color, 0);
     
-    // Texte confort
-    comfortLabel = lv_label_create(card);
-    lv_label_set_text(comfortLabel, "--");
-    lv_obj_set_style_text_font(comfortLabel, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(comfortLabel, 10, 115);
-    lv_obj_set_align(comfortLabel, LV_ALIGN_CENTER);
-    lv_obj_set_width(comfortLabel, 100);
-    lv_label_set_long_mode(comfortLabel, LV_LABEL_LONG_DOT);
-    
-    // Min/Max
-    lv_obj_t* minmax = lv_obj_create(card);
-    lv_obj_set_size(minmax, 100, 40);
-    lv_obj_set_pos(minmax, 120, 30);
-    lv_obj_set_style_bg_opa(minmax, LV_OPA_20, 0);
-    lv_obj_set_style_radius(minmax, 5, 0);
-    lv_obj_set_style_border_width(minmax, 0, 0);
-    
-    tempMinLabel = lv_label_create(minmax);
-    lv_label_set_text(tempMinLabel, "Min: --.-");
-    lv_obj_set_style_text_color(tempMinLabel, lv_color_hex(0x74b9ff), 0);
-    lv_obj_set_style_text_font(tempMinLabel, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(tempMinLabel, 5, 5);
-    
-    tempMaxLabel = lv_label_create(minmax);
-    lv_label_set_text(tempMaxLabel, "Max: --.-");
-    lv_obj_set_style_text_color(tempMaxLabel, lv_color_hex(0xff6b6b), 0);
-    lv_obj_set_style_text_font(tempMaxLabel, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(tempMaxLabel, 5, 22);
+    return badge;
 }
 
-void PageWeather::createEnvCard(lv_obj_t* parent) {
-    lv_obj_t* card = createCard(parent, "ENV", 175, 90);
-    
-    // Humidité
-    lv_obj_t* lblHum = lv_label_create(card);
-    lv_label_set_text(lblHum, "Hum:");
-    lv_obj_set_style_text_font(lblHum, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(lblHum, 10, 30);
-    
-    humidityLabel = lv_label_create(card);
-    lv_label_set_text(humidityLabel, "--%");
-    lv_obj_set_style_text_font(humidityLabel, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(humidityLabel, 50, 28);
-    
-    humidityTrend = lv_label_create(card);
-    lv_label_set_text(humidityTrend, "-");
-    lv_obj_set_style_text_font(humidityTrend, &lv_font_montserrat_10, 0);
-    lv_obj_set_pos(humidityTrend, 95, 32);
-    
-    // Pression
-    lv_obj_t* lblPress = lv_label_create(card);
-    lv_label_set_text(lblPress, "Baro:");
-    lv_obj_set_style_text_font(lblPress, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(lblPress, 10, 55);
-    
-    pressureLabel = lv_label_create(card);
-    lv_label_set_text(pressureLabel, "----");
-    lv_obj_set_style_text_font(pressureLabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(pressureLabel, 50, 53);
-    
-    pressureTrend = lv_label_create(card);
-    lv_label_set_text(pressureTrend, "-");
-    lv_obj_set_style_text_font(pressureTrend, &lv_font_montserrat_10, 0);
-    lv_obj_set_pos(pressureTrend, 100, 57);
-    
-    // Point de rosée barre
-    lv_obj_t* lblDew = lv_label_create(card);
-    lv_label_set_text(lblDew, "Rosée:");
-    lv_obj_set_style_text_font(lblDew, &lv_font_montserrat_10, 0);
-    lv_obj_set_pos(lblDew, 10, 85);
-    
-    dewPointLabel = lv_label_create(card);
-    lv_label_set_text(dewPointLabel, "--.-");
-    lv_obj_set_style_text_font(dewPointLabel, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(dewPointLabel, 55, 84);
-    
-    dewPointBar = lv_bar_create(card);
-    lv_obj_set_size(dewPointBar, 120, 6);
-    lv_obj_set_pos(dewPointBar, 10, 105);
-    lv_bar_set_range(dewPointBar, 0, 20);
-    lv_bar_set_value(dewPointBar, 10, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(dewPointBar, lv_color_hex(0x333333), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(dewPointBar, lv_color_hex(0x9b59b6), LV_PART_INDICATOR);
-}
-
-void PageWeather::createOutdoorCard(lv_obj_t* parent) {
-    lv_obj_t* card = createCard(parent, "EXTERIEUR", 330, 90);
-    
-    // Icône météo (texte pour l'instant)
-    lv_obj_t* icon = lv_label_create(card);
-    lv_label_set_text(icon, "☀️");
-    lv_obj_set_style_text_font(icon, &lv_font_montserrat_36, 0);
-    lv_obj_set_pos(icon, 20, 30);
-    
-    // Température ext
-    lv_obj_t* lblExt = lv_label_create(card);
-    lv_label_set_text(lblExt, "Ext:");
-    lv_obj_set_style_text_font(lblExt, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(lblExt, 70, 35);
-    
-    lv_obj_t* valExt = lv_label_create(card);
-    lv_label_set_text(valExt, "--°");
-    lv_obj_set_style_text_font(valExt, &lv_font_montserrat_20, 0);
-    lv_obj_set_pos(valExt, 100, 32);
-    
-    // Vent
-    lv_obj_t* lblWind = lv_label_create(card);
-    lv_label_set_text(lblWind, "Vent: -- km/h");
-    lv_obj_set_style_text_font(lblWind, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(lblWind, 10, 85);
-}
-
-void PageWeather::createHistoryChart(lv_obj_t* parent) {
+// Créer une carte réutilisable
+static lv_obj_t* createCard(lv_obj_t* parent, const char* title,
+                       lv_coord_t x, lv_coord_t y,
+                       lv_coord_t w = 140, lv_coord_t h = 120) {
     lv_obj_t* card = lv_obj_create(parent);
-    lv_obj_set_size(card, 440, 110);
-    lv_obj_set_pos(card, 20, 195);
-    lv_obj_set_style_bg_color(card, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_20, 0);
-    lv_obj_set_style_radius(card, 10, 0);
-    lv_obj_set_style_border_width(card, 0, 0);
-    
-    // Titre
-    lv_obj_t* title = lv_label_create(card);
-    lv_label_set_text(title, "24h");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(title, 10, 5);
-    
-    // Chart LVGL
-    chart = lv_chart_create(card);
-    lv_obj_set_size(chart, 420, 75);
-    lv_obj_set_pos(chart, 10, 25);
-    lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, 10, 30);
-    lv_chart_set_range(chart, LV_CHART_AXIS_SECONDARY_Y, 40, 90);
-    lv_chart_set_point_count(chart, 24);
-    lv_obj_set_style_size(chart, 0, LV_PART_INDICATOR); // Pas de points
-    
-    tempSeries = lv_chart_add_series(chart, lv_color_hex(0x2ecc71), LV_CHART_AXIS_PRIMARY_Y);
-    humSeries = lv_chart_add_series(chart, lv_color_hex(0x3498db), LV_CHART_AXIS_SECONDARY_Y);
-    
-    // Initialiser avec données vides
-    for (int i = 0; i < 24; i++) {
-        tempSeries->y_points[i] = LV_CHART_POINT_NONE;
-        humSeries->y_points[i] = LV_CHART_POINT_NONE;
-    }
-}
-
-lv_obj_t* PageWeather::createCard(lv_obj_t* parent, const char* title, lv_coord_t x, lv_coord_t y) {
-    lv_obj_t* card = lv_obj_create(parent);
-    lv_obj_set_size(card, 140, 95);
+    lv_obj_set_size(card, w, h);
     lv_obj_set_pos(card, x, y);
-    lv_obj_set_style_bg_color(card, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_10, 0);
-    lv_obj_set_style_radius(card, 10, 0);
-    lv_obj_set_style_border_width(card, 0, 0);
-    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_add_style(card, &ui.style_card, 0);
     
-    lv_obj_t* lbl = lv_label_create(card);
-    lv_label_set_text(lbl, title);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_opa(lbl, LV_OPA_70, 0);
-    lv_obj_set_pos(lbl, 10, 8);
+    // Titre carte
+    if (title && title[0]) {
+        lv_obj_t* lbl = lv_label_create(card);
+        lv_label_set_text(lbl, title);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_opa(lbl, LV_OPA_70, 0);
+        lv_obj_set_pos(lbl, 10, 6);
+    }
     
     return card;
 }
 
-void PageWeather::update(const WeatherManager& weather) {
-    const BME280Data& data = weather.getBMEData();
+// ═══════════════════════════════════════════════════════════════════════
+//  BUILD : Construction de la page
+// ═══════════════════════════════════════════════════════════════════════
+
+void page_weather_build(lv_obj_t* parent) {
+    // Fond commun dashboard
+    ui_draw_bg(parent);
     
-    if (!data.valid) {
-        lv_label_set_text(tempLabel, "ERR");
-        return;
-    }
+    // Titre de page
+    ui_create_title_bar(parent, LV_SYMBOL_BELL, "Météo BME280", COLOR_BLUE);
     
-    // Température
-    updateTempDisplay(data.temperature);
-    lv_label_set_text_fmt(tempMinLabel, "Min: %.1f°", weather.getMinTemp24h());
-    lv_label_set_text_fmt(tempMaxLabel, "Max: %.1f°", weather.getMaxTemp24h());
+    // ── ZONE ALERTES (haut, hauteur dynamique) ────────────────────────
+    weather_alert_container = lv_obj_create(parent);
+    lv_obj_set_size(weather_alert_container, SCREEN_WIDTH - 40, 0);
+    lv_obj_set_pos(weather_alert_container, 20, 52);
+    lv_obj_set_style_bg_opa(weather_alert_container, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(weather_alert_container, 0, 0);
+    lv_obj_set_style_pad_all(weather_alert_container, 0, 0);
+    lv_obj_set_flex_flow(weather_alert_container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(weather_alert_container, 
+        LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     
-    // Humidité avec tendance
-    lv_label_set_text_fmt(humidityLabel, "%.0f%%", data.humidity);
-    float humTrend = weather.getHistory().getTempTrend(); // Approximation
-    lv_label_set_text(humidityTrend, getTrendIcon(humTrend));
-    lv_obj_set_style_text_color(humidityTrend, 
-        humTrend > 0 ? lv_color_hex(0xe74c3c) : lv_color_hex(0x3498db), 0);
+    // ── CARTE TEMPÉRATURE INTÉRIEURE (gauche) ───────────────────────────
+    lv_obj_t* cardTemp = createCard(parent, "INTÉRIEUR", 20, 90, 140, 130);
     
-    // Pression avec tendance
-    lv_label_set_text_fmt(pressureLabel, "%.0f", data.pressure);
-    float pressTrend = weather.getHistory().getPressureTrend();
-    lv_label_set_text(pressureTrend, getTrendIcon(pressTrend));
+    // Arc gauge température
+    weather_temp_arc = lv_arc_create(cardTemp);
+    lv_obj_set_size(weather_temp_arc, 100, 100);
+    lv_obj_set_pos(weather_temp_arc, 10, 22);
+    lv_arc_set_range(weather_temp_arc, -10, 50);
+    lv_arc_set_value(weather_temp_arc, 20);
+    lv_arc_set_bg_angles(weather_temp_arc, 120, 60);  // 270° arc
+    lv_obj_set_style_arc_width(weather_temp_arc, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(weather_temp_arc, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(weather_temp_arc, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_clear_flag(weather_temp_arc, LV_OBJ_FLAG_CLICKABLE);
+    
+    // Label valeur centre arc
+    weather_temp_label = lv_label_create(cardTemp);
+    lv_label_set_text(weather_temp_label, "--.-°");
+    lv_obj_set_style_text_font(weather_temp_label, &lv_font_montserrat_24, 0);
+    lv_obj_center(weather_temp_label);
+    lv_obj_align(weather_temp_label, LV_ALIGN_CENTER);
+    lv_obj_set_pos(weather_temp_label, 10, 22);
+    
+    // Label confort
+    weather_comfort_label = lv_label_create(cardTemp);
+    lv_label_set_text(weather_comfort_label, "--");
+    lv_obj_set_style_text_font(weather_comfort_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(weather_comfort_label, 10, 115);
+    lv_obj_align(weather_comfort_label, LV_ALIGN_CENTER);
+    lv_obj_set_width(weather_comfort_label, 100);
+    lv_label_set_long_mode(weather_comfort_label, LV_LABEL_LONG_DOT);
+    
+    // Min/Max
+    lv_obj_t* minmaxBox = lv_obj_create(cardTemp);
+    lv_obj_set_size(minmaxBox, 105, 36);
+    lv_obj_set_pos(minmaxBox, 118, 28);
+    lv_obj_set_style_bg_opa(minmaxBox, LV_OPA_20, 0);
+    lv_obj_set_style_radius(minmaxBox, 5, 0);
+    lv_obj_set_style_border_width(minmaxBox, 0, 0);
+    
+    weather_temp_min_label = lv_label_create(minmaxBox);
+    lv_label_set_text(weather_temp_min_label, "Min: --.-°");
+    lv_obj_set_style_text_color(weather_temp_min_label, lv_color_hex(0x74b9ff), 0);
+    lv_obj_set_style_text_font(weather_temp_min_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(weather_temp_min_label, 5, 5);
+    
+    weather_temp_max_label = lv_label_create(minmaxBox);
+    lv_label_set_text(weather_temp_max_label, "Max: --.-°");
+    lv_obj_set_style_text_color(weather_temp_max_label, lv_color_hex(0xff6b6b), 0);
+    lv_obj_set_style_text_font(weather_temp_max_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(weather_temp_max_label, 5, 20);
+    
+    // ── CARTE ENVIRONNEMENT (centre) ───────────────────────────────────
+    lv_obj_t* cardEnv = createCard(parent, "ENVIRONNEMENT", 170, 90, 145, 130);
+    
+    // Humidité
+    lv_obj_t* lblHum = lv_label_create(cardEnv);
+    lv_label_set_text(lblHum, "Hum:");
+    lv_obj_set_style_text_font(lblHum, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(lblHum, 10, 28);
+    
+    weather_humidity_label = lv_label_create(cardEnv);
+    lv_label_set_text(weather_humidity_label, "--%");
+    lv_obj_set_style_text_font(weather_humidity_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(weather_humidity_label, 45, 26);
+    
+    weather_humidity_trend = lv_label_create(cardEnv);
+    lv_label_set_text(weather_humidity_trend, "-");
+    lv_obj_set_style_text_font(weather_humidity_trend, &lv_font_montserrat_10, 0);
+    lv_obj_set_pos(weather_humidity_trend, 90, 30);
+    
+    // Pression
+    lv_obj_t* lblPress = lv_label_create(cardEnv);
+    lv_label_set_text(lblPress, "Baro:");
+    lv_obj_set_style_text_font(lblPress, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(lblPress, 10, 52);
+    
+    weather_pressure_label = lv_label_create(cardEnv);
+    lv_label_set_text(weather_pressure_label, "----");
+    lv_obj_set_style_text_font(weather_pressure_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(weather_pressure_label, 48, 50);
+    
+    weather_pressure_trend = lv_label_create(cardEnv);
+    lv_label_set_text(weather_pressure_trend, "-");
+    lv_obj_set_style_text_font(weather_pressure_trend, &lv_font_montserrat_10, 0);
+    lv_obj_set_pos(weather_pressure_trend, 95, 54);
     
     // Point de rosée
-    updateDewPoint(data.temperature, data.humidity);
+    lv_obj_t* lblDew = lv_label_create(cardEnv);
+    lv_label_set_text(lblDew, "Rosée:");
+    lv_obj_set_style_text_font(lblDew, &lv_font_montserrat_10, 0);
+    lv_obj_set_pos(lblDew, 10, 82);
     
-    // Alertes
-    updateAlerts(weather);
+    weather_dew_point_label = lv_label_create(cardEnv);
+    lv_label_set_text(weather_dew_point_label, "--.-°");
+    lv_obj_set_style_text_font(weather_dew_point_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(weather_dew_point_label, 50, 80);
     
-    // Graphique
-    updateChart(weather.getHistory());
+    weather_dew_point_bar = lv_bar_create(cardEnv);
+    lv_obj_set_size(weather_dew_point_bar, 125, 6);
+    lv_obj_set_pos(weather_dew_point_bar, 10, 102);
+    lv_bar_set_range(weather_dew_point_bar, 0, 20);
+    lv_bar_set_value(weather_dew_point_bar, 10, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(weather_dew_point_bar, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(weather_dew_point_bar, lv_color_hex(0x9b59b6), LV_PART_INDICATOR);
+    
+    // ── CARTE EXTÉRIEURE (droite) ──────────────────────────────────────
+    lv_obj_t* cardOut = createCard(parent, "EXTÉRIEUR", 325, 90, 135, 130);
+    
+    // Icône météo extérieure
+    weather_outdoor_icon = lv_label_create(cardOut);
+    lv_label_set_text(weather_outdoor_icon, "☀️");
+    lv_obj_set_style_text_font(weather_outdoor_icon, &lv_font_montserrat_36, 0);
+    lv_obj_set_pos(weather_outdoor_icon, 20, 28);
+    
+    // Température extérieure
+    lv_obj_t* lblExt = lv_label_create(cardOut);
+    lv_label_set_text(lblExt, "Ext:");
+    lv_obj_set_style_text_font(lblExt, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(lblExt, 70, 35);
+    
+    weather_outdoor_temp = lv_label_create(cardOut);
+    lv_label_set_text(weather_outdoor_temp, "--°");
+    lv_obj_set_style_text_font(weather_outdoor_temp, &lv_font_montserrat_20, 0);
+    lv_obj_set_pos(weather_outdoor_temp, 98, 32);
+    
+    // Vent
+    weather_wind_label = lv_label_create(cardOut);
+    lv_label_set_text(weather_wind_label, "Vent: -- km/h");
+    lv_obj_set_style_text_font(weather_wind_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(weather_wind_label, 10, 85);
+    
+    // ── GRAPHIQUE HISTORIQUE 24H (bas) ─────────────────────────────────
+    lv_obj_t* cardChart = lv_obj_create(parent);
+    lv_obj_set_size(cardChart, SCREEN_WIDTH - 40, 110);
+    lv_obj_set_pos(cardChart, 20, 230);
+    lv_obj_add_style(cardChart, &ui.style_card, 0);
+    
+    // Titre chart
+    lv_obj_t* chartTitle = lv_label_create(cardChart);
+    lv_label_set_text(chartTitle, "Historique 24h");
+    lv_obj_set_style_text_font(chartTitle, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(chartTitle, COLOR_GRAY, 0);
+    lv_obj_set_pos(chartTitle, 10, 4);
+    
+    // Chart LVGL
+    weather_chart = lv_chart_create(cardChart);
+    lv_obj_set_size(weather_chart, SCREEN_WIDTH - 60, 80);
+    lv_obj_set_pos(weather_chart, 10, 22);
+    lv_chart_set_type(weather_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_range(weather_chart, LV_CHART_AXIS_PRIMARY_Y, 10, 30);   // Température
+    lv_chart_set_range(weather_chart, LV_CHART_AXIS_SECONDARY_Y, 40, 90);  // Humidité
+    lv_chart_set_point_count(weather_chart, 24);
+    lv_obj_set_style_size(weather_chart, 0, LV_PART_INDICATOR);  // Pas de points
+    
+    // Séries
+    weather_temp_series = lv_chart_add_series(weather_chart, lv_color_hex(0x2ecc71), LV_CHART_AXIS_PRIMARY_Y);
+    weather_hum_series = lv_chart_add_series(weather_chart, lv_color_hex(0x3498db), LV_CHART_AXIS_SECONDARY_Y);
+    
+    // Initialiser vides
+    for (int i = 0; i < 24; i++) {
+        weather_temp_series->y_points[i] = LV_CHART_POINT_NONE;
+        weather_hum_series->y_points[i] = LV_CHART_POINT_NONE;
+    }
+    
+    // Barre de navigation
+    ui_create_nav_bar(parent, PAGE_WEATHER);
+    
+    // Initialiser historique
+    bmeHistory.begin();
 }
 
-void PageWeather::updateTempDisplay(float temp) {
-    lv_arc_set_value(tempArc, (int16_t)temp);
-    lv_label_set_text_fmt(tempLabel, "%.1f°", temp);
-    
-    lv_color_t color = getTempColor(temp);
-    lv_obj_set_style_arc_color(tempArc, color, LV_PART_INDICATOR);
-    
-    lv_label_set_text(comfortLabel, getComfortText(temp));
-    lv_obj_set_style_text_color(comfortLabel, color, 0);
-}
+// ═══════════════════════════════════════════════════════════════════════
+//  UPDATE : Mise à jour des données (appelé dans loop())
+// ═══════════════════════════════════════════════════════════════════════
 
-void PageWeather::updateDewPoint(float temp, float humidity) {
-    float dewPoint = BME280Alerts::calculateDewPoint(temp, humidity);
-    float margin = temp - dewPoint;
+void page_weather_update() {
+    // Récupérer données BME280 depuis WeatherManager global
+    const BME280Data& data = weatherManager.getData();
     
-    lv_label_set_text_fmt(dewPointLabel, "%.1f°", dewPoint);
-    
-    // Barre de risque: 20 = sécurité, 0 = condensation
-    int barVal = (int)(margin * 5); // 4°C marge = 20 (max)
-    if (barVal < 0) barVal = 0;
-    if (barVal > 20) barVal = 20;
-    lv_bar_set_value(dewPointBar, barVal, LV_ANIM_ON);
-    
-    // Couleur selon risque
-    lv_color_t barColor;
-    if (margin < 3) barColor = lv_color_hex(0xe74c3c);      // Rouge danger
-    else if (margin < 5) barColor = lv_color_hex(0xf39c12); // Orange attention
-    else barColor = lv_color_hex(0x9b59b6);                 // Violet OK
-    
-    lv_obj_set_style_bg_color(dewPointBar, barColor, LV_PART_INDICATOR);
-}
-
-void PageWeather::updateAlerts(const WeatherManager& weather) {
-    // Vider conteneur
-    lv_obj_clean(alertContainer);
-    
-    if (!weather.hasAnyAlert()) {
-        lv_obj_set_height(alertContainer, 0);
+    if (!data.valid) {
+        lv_label_set_text(weather_temp_label, "ERR");
         return;
     }
     
+    // ── MISE À JOUR TEMPÉRATURE ────────────────────────────────────────
+    float temp = data.temperature;
+    lv_arc_set_value(weather_temp_arc, (int16_t)temp);
+    lv_label_set_text_fmt(weather_temp_label, "%.1f°", temp);
+    
+    lv_color_t tempColor = getTempColor(temp);
+    lv_obj_set_style_arc_color(weather_temp_arc, tempColor, LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(weather_temp_label, tempColor, 0);
+    lv_label_set_text(weather_comfort_label, getComfortText(temp));
+    lv_obj_set_style_text_color(weather_comfort_label, tempColor, 0);
+    
+    // Min/Max 24h depuis historique
+    lv_label_set_text_fmt(weather_temp_min_label, "Min: %.1f°", bmeHistory.getMinTemp24h());
+    lv_label_set_text_fmt(weather_temp_max_label, "Max: %.1f°", bmeHistory.getMaxTemp24h());
+    
+    // ── MISE À JOUR ENVIRONNEMENT ──────────────────────────────────────
+    lv_label_set_text_fmt(weather_humidity_label, "%.0f%%", data.humidity);
+    
+    float humTrend = bmeHistory.getHumidityTrend();
+    lv_label_set_text(weather_humidity_trend, getTrendIcon(humTrend));
+    lv_obj_set_style_text_color(weather_humidity_trend, 
+        humTrend > 0.5 ? lv_color_hex(0xe74c3c) : lv_color_hex(0x3498db), 0);
+    
+    lv_label_set_text_fmt(weather_pressure_label, "%.0f", data.pressure);
+    
+    float pressTrend = bmeHistory.getPressureTrend();
+    lv_label_set_text(weather_pressure_trend, getTrendIcon(pressTrend));
+    
+    // Point de rosée
+    float dewPoint = BME280Alerts::calculateDewPoint(temp, data.humidity);
+    float dewMargin = temp - dewPoint;
+    
+    lv_label_set_text_fmt(weather_dew_point_label, "%.1f°", dewPoint);
+    lv_bar_set_value(weather_dew_point_bar, 
+        (lv_coord_t)(dewMargin > 0 ? dewMargin : 0), LV_ANIM_OFF);
+    
+    // Couleur barre rosée selon marge
+    lv_color_t dewColor = (dewMargin < 3.0f) ? 
+        lv_color_hex(0xe74c3c) : lv_color_hex(0x9b59b6);
+    lv_obj_set_style_bg_color(weather_dew_point_bar, dewColor, LV_PART_INDICATOR);
+    
+    // ── MISE À JOUR EXTÉRIEUR (API OWM) ────────────────────────────────
+    if (weatherData.valid && weatherData.current.valid) {
+        lv_label_set_text(weather_outdoor_icon, weatherData.current.icon_lv);
+        lv_label_set_text_fmt(weather_outdoor_temp, "%.0f°", weatherData.current.temp);
+        lv_label_set_text_fmt(weather_wind_label, "Vent: %.0f km/h %s",
+            weatherData.current.wind_speed_kmh,
+            wind_deg_to_dir(weatherData.current.wind_deg));
+    }
+    
+    // ── MISE À JOUR GRAPHIQUE HISTORIQUE ───────────────────────────────
+    const BME280History::HistoryPoint* hist = bmeHistory.getHistory24h();
+    int count = bmeHistory.getHistoryCount();
+    
+    for (int i = 0; i < count && i < 24; i++) {
+        weather_temp_series->y_points[i] = hist[i].temperature;
+        weather_hum_series->y_points[i] = hist[i].humidity;
+    }
+    // Rafraîchir chart
+    lv_chart_refresh(weather_chart);
+    
+    // ── VÉRIFICATION ALERTES ───────────────────────────────────────────
+    bmeAlerts.check(temp, data.humidity, data.pressure, dewPoint);
+    
     uint8_t alertCount = 0;
-    Alert* alerts = weather.getAlerts().getActiveAlerts(alertCount);
+    Alert* alerts = bmeAlerts.getActiveAlerts(alertCount);
     
-    lv_obj_set_height(alertContainer, alertCount * 25);
+    // Nettoyer anciens badges
+    lv_obj_clean(weather_alert_container);
     
-    for (int i = 0; i < 7; i++) {
-        if (!alerts[i].active) continue;
-        
-        lv_obj_t* alert = lv_obj_create(alertContainer);
-        lv_obj_set_size(alert, 440, 22);
-        lv_obj_set_style_bg_color(alert, lv_color_hex(alerts[i].color), 0);
-        lv_obj_set_style_radius(alert, 5, 0);
-        lv_obj_set_style_border_width(alert, 0, 0);
-        lv_obj_set_style_pad_all(alert, 2, 0);
-        
-        lv_obj_t* icon = lv_label_create(alert);
-        lv_label_set_text(icon, alerts[i].icon);
-        lv_obj_set_pos(icon, 5, 2);
-        
-        lv_obj_t* txt = lv_label_create(alert);
-        lv_label_set_text(txt, alerts[i].title);
-        lv_obj_set_style_text_font(txt, &lv_font_montserrat_12, 0);
-        lv_obj_set_pos(txt, 30, 3);
-    }
-}
-
-void PageWeather::updateChart(const BME280History& history) {
-    uint8_t count = history.getCount();
-    if (count < 2) return;
-    
-    // Afficher jusqu'à 24 points
-    uint8_t displayCount = (count < 24) ? count : 24;
-    
-    for (uint8_t i = 0; i < displayCount; i++) {
-        const HistoryPoint* pt = history.getSample(count - displayCount + i);
-        if (pt) {
-            tempSeries->y_points[i] = (lv_coord_t)pt->temperature;
-            humSeries->y_points[i] = (lv_coord_t)pt->humidity;
-        }
+    // Créer nouveaux badges actifs
+    for (uint8_t i = 0; i < alertCount; i++) {
+        createAlertBadge(weather_alert_container, alerts[i]);
     }
     
-    lv_chart_refresh(chart);
-}
-
-lv_color_t PageWeather::getTempColor(float temp) {
-    if (temp < 15) return lv_color_hex(0x3498db);      // Bleu
-    if (temp > 25) return lv_color_hex(0xe74c3c);      // Rouge
-    if (temp >= 19 && temp <= 22) return lv_color_hex(0x2ecc71); // Vert
-    return lv_color_hex(0xf39c12);                      // Orange
-}
-
-const char* PageWeather::getComfortText(float temp) {
-    if (temp < 15) return "Froid";
-    if (temp > 25) return "Chaud";
-    if (temp >= 19 && temp <= 22) return "Confort";
-    return "OK";
-}
-
-const char* PageWeather::getTrendIcon(float trend) {
-    if (trend > 0.5) return "↑";
-    if (trend < -0.5) return "↓";
-    return "→";
-}
-
-void PageWeather::show() {
-    if (page) lv_scr_load(page);
-}
-
-void PageWeather::hide() {
-    // Géré par le gestionnaire de pages
+    // Ajouter données à l'historique (toutes les 5 min)
+    bmeHistory.addPoint(temp, data.humidity, data.pressure);
 }

@@ -1,5 +1,6 @@
 /*
  * ui.cpp - Gestionnaire principal LVGL
+ * MODIFICATIONS pour intégration page_weather
  */
 #include "ui.h"
 #include "ui_helpers.h"
@@ -21,12 +22,14 @@ void UiManager::begin() {
 // ============================================================
 void UiManager::update() {
     lv_timer_handler();
-    page_status_update();   // status bar globale — toujours actif
+    page_status_update();
+    
     switch (_currentPage) {
         case PAGE_HOME:    page_home_update();    break;
         case PAGE_BATTERY: page_battery_update(); break;
         case PAGE_HEATING: page_heating_update(); break;
         case PAGE_SYSTEM:  page_system_update();  break;
+        case PAGE_WEATHER: page_weather_update(); break;  // ← AJOUTÉ
         default: break;
     }
 }
@@ -148,6 +151,7 @@ void UiManager::_buildAllPages() {
     page_battery_build(_pages[PAGE_BATTERY]);
     page_heating_build(_pages[PAGE_HEATING]);
     page_system_build(_pages[PAGE_SYSTEM]);
+	page_weather_build(_pages[PAGE_WEATHER]);
 
     // ── Barre de statut globale (overlay — au-dessus de toutes les pages) ──────
     lv_obj_t* sb = lv_obj_create(screen);

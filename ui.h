@@ -1,18 +1,21 @@
 #pragma once
 /*
  * ui.h - Gestionnaire LVGL global
+ * MODIFICATIONS pour intégration page_weather
  */
 #include <Arduino.h>
 #include <lvgl.h>
+#include <stdint.h>
 
 // Pages du dashboard
 typedef enum {
-    PAGE_HOME    = 0,
-    PAGE_LIGHTS  = 1,
-    PAGE_BATTERY = 2,
-    PAGE_HEATING = 3,
-    PAGE_SYSTEM  = 4,
-    PAGE_COUNT
+    PAGE_HOME     = 0,
+    PAGE_LIGHTS   = 1,
+    PAGE_BATTERY  = 2,
+    PAGE_HEATING  = 3,
+    PAGE_SYSTEM   = 4,
+    PAGE_WEATHER  = 5,       // ← AJOUTÉ
+    PAGE_COUNT               // ← Maintenant = 6
 } DashPage;
 
 // Couleurs du theme van
@@ -61,19 +64,18 @@ private:
 extern UiManager ui;
 
 // ---- Pages individuelles (forward declarations) ----
-void ui_draw_bg(lv_obj_t* parent);  // Fond commun degrade sombre
-
+void ui_draw_bg(lv_obj_t* parent);
 void page_home_build(lv_obj_t* parent);
 void page_home_update();
-void page_status_update();  // mise a jour barre statut globale
-
+void page_status_update();
 void page_lights_build(lv_obj_t* parent);
-
 void page_battery_build(lv_obj_t* parent);
 void page_battery_update();
-
 void page_heating_build(lv_obj_t* parent);
 void page_heating_update();
-
 void page_system_build(lv_obj_t* parent);
 void page_system_update();
+
+// ← AJOUTÉ : Page météo (pattern standard)
+void page_weather_build(lv_obj_t* parent);
+void page_weather_update();
