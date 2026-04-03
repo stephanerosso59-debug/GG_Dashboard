@@ -10,6 +10,17 @@
 #define SCREEN_HEIGHT   320
 #define SCREEN_ROTATION 1     // 0=portrait, 1=paysage
 
+//weather bme280 Configuration
+#define BME280_SDA_PIN 21      // ou votre pin I2C
+#define BME280_SCL_PIN 22      // ou votre pin I2C
+#define BME280_I2C_ADDR 0x76   // ou 0x77
+// Seuils alertes (modifiables)
+#define ALERT_FREEZE_TEMP       2.0f
+#define ALERT_HIGH_TEMP         35.0f
+#define ALERT_HIGH_HUMIDITY     70.0f
+#define ALERT_LOW_PRESSURE      980.0f
+#define ALERT_CONDENSATION_MARGIN 3.0f
+
 // ─── SPI TFT ──────────────────────────────────────────────
 #define PIN_TFT_MISO    19
 #define PIN_TFT_MOSI    23

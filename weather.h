@@ -7,7 +7,25 @@
  * vent (vitesse+direction), pluie, UV, lever/coucher soleil, code icone.
  */
 #include <Arduino.h>
+#include "bme280_sensor.h"
 
+class WeatherManager {
+public:
+    bool begin();
+    void update();  // Appeler dans loop()
+    
+    // Données BME280 intérieur
+    float getIndoorTemp() const;
+    float getIndoorHumidity() const;
+    float getPressure() const;
+    
+    // Données extérieures (API météo si connecté)
+    float getOutdoorTemp() const;
+    
+private:
+    BME280Sensor bme;
+    // ... vos données API météo existantes
+};
 // ─── Donnees par jour ─────────────────────────────────────────────────────────
 struct WeatherDay {
     // Temperatures

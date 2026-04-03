@@ -70,7 +70,7 @@ pio device monitor
 ## Structure
 
 ```
-workspace_lvgl/
+Dasboard GG/
 ├── platformio.ini
 ├── lib/
 │   └── lv_conf.h          Configuration LVGL
@@ -88,7 +88,7 @@ workspace_lvgl/
         └── van_ui_anim_init.cpp Enregistrement animations
 
 
-Code BLE et meteo partage avec les autres workspaces dans `
+Code BLE et meteo partage avec les autres Dasboard GG dans `
 ../shared/`
 │   ├── ble/ 
 		├── ble_scanner.cpp

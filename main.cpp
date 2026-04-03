@@ -8,6 +8,10 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <esp_task_wdt.h>
+#include "ui/pir_sensor.h"
+#include "config.h"
+#include "../shared/weather/weather.h"
+#include "ui/page_weather.h"
 
 #include "config.h"
 #include "ble/jkbms_ble.h"
@@ -36,6 +40,8 @@ static uint32_t t_clock_update = 0;
 static uint32_t t_ble_update = 0;
 static uint8_t wifi_retry_count = 0;
 
+WeatherManager weather;
+PageWeather pageWeather;
 WiFiUDP ntp_udp;
 NTPClient ntp_client(ntp_udp, NTP_SERVER, NTP_GMT_OFFSET + NTP_DST_OFFSET);
 
@@ -73,6 +79,7 @@ static void wifi_connect() {
     van_anim_set_wifi(ok);
 }
 
+
 // ─── Setup ────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -86,6 +93,10 @@ void setup() {
     esp_task_wdt_add(NULL);
     Serial.println("[WDT] OK");
 
+	 // I2C pour BME280
+    weather.begin(BME280_SDA_PIN, BME280_SCL_PIN);
+	pageWeather.create();
+	
     // Relais OFF par defaut
     const uint8_t relay_pins[] = {
         RELAY_LIGHT1, RELAY_LIGHT2, RELAY_LIGHT3,
@@ -103,6 +114,15 @@ void setup() {
     // LVGL + TFT
     ui.begin();
 
+	pir_sensor_init(
+		[]() { /* callback écran allumé */
+        Serial.println("[SYS] Écran activé - Bienvenue !");
+		},
+		[]() { /* callback écran éteint */
+        Serial.println("[SYS] Mode économie - En attente...");
+		}
+	);
+	
     // BLE
     jkBms.begin();
     victronBle.begin();
@@ -139,14 +159,38 @@ void setup() {
 void loop() {
     uint32_t now = millis();
 
-    lv_timer_handler();
+	weather.update();
+	pageWeather.update(weather);
 
     jkBms.update();
     victronBle.update();
     heatingBle.update();
 
     water_level_update();
+	
+	// Update UI si page météo active
+    if (currentPage == PAGE_WEATHER) {
+        pageWeather.update(weather);
+    }
+    
+    lv_timer_handler();
+    delay(5);
+	
+	// Mise à jour capteur PIR (vérifie toutes les 200ms)
+	if (pir_sensor_update()) {
+    // L'état de l'écran vient de changer
+    if (pir_get_screen_state() == SCREEN_STATE_ON) {
+        // Écran rallumé → forcer rafraîchissement UI
+        page_home_update();
+        page_status_update();
+		}
+	}
 
+	// Watchdog reset (comme d'habitude)
+	esp_task_wdt_reset();
+
+	delay(5);
+	
     // Etat BLE -> animations
     if (now - t_ble_update >= UI_BLE_UPDATE_MS) {
         t_ble_update = now;

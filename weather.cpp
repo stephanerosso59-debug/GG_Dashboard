@@ -18,6 +18,20 @@
 
 WeatherData weatherData = {};
 
+bool WeatherManager::begin() {
+    // I2C déjà initialisé dans main.cpp
+    return bme.begin(0x76); // ou 0x77 selon votre module
+}
+
+void WeatherManager::update() {
+    bme.update();
+    // ... update API météo
+}
+
+float WeatherManager::getIndoorTemp() const {
+    return bme.getTemperature();
+}
+// ... etc
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helpers publics
 // ─────────────────────────────────────────────────────────────────────────────
